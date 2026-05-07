@@ -1,0 +1,458 @@
+pragma language_version >= 0.22;
+
+import CompactStandardLibrary;
+
+
+export struct DepositSlot {
+    depositAmount: Uint<64>,
+    depositColor: Bytes<32>
+}
+
+export ledger commitments: HistoricMerkleTree<14, Bytes<32>>;
+export ledger nullifiers: Set<Bytes<32>>;
+export ledger deposits: Map<Bytes<32>, DepositSlot>;
+
+export ledger baseColor: Bytes<32>;
+export ledger quoteColor: Bytes<32>;
+
+export ledger feeBps: Uint<16>;
+export ledger treasury: Either<ContractAddress, UserAddress>;
+export ledger feeAccumulated: Uint<128>;
+export ledger counter: Uint<64>;
+
+
+constructor(
+    f: Uint<16>,
+    t: Either<ContractAddress, UserAddress>,
+    bc: Bytes<32>,
+    qc: Bytes<32>
+) {
+    assert(f < 10000, "Fee too high");
+    feeBps = disclose(f);
+    treasury = disclose(t);
+    baseColor = disclose(bc);
+    quoteColor = disclose(qc);
+    feeAccumulated = 0;
+    counter = 0;
+}
+
+witness orderData1(): Vector<5, Bytes<32>>;
+witness orderData2(): Vector<5, Bytes<32>>;
+witness orderData3(): Vector<5, Bytes<32>>;
+witness orderData4(): Vector<5, Bytes<32>>;
+witness orderData5(): Vector<5, Bytes<32>>;
+witness orderData6(): Vector<5, Bytes<32>>;
+witness orderData7(): Vector<5, Bytes<32>>;
+witness orderData8(): Vector<5, Bytes<32>>;
+
+witness findPath1(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+witness findPath2(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+witness findPath3(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+witness findPath4(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+witness findPath5(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+witness findPath6(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+witness findPath7(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+witness findPath8(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+
+witness cancelOrderData(): Vector<5, Bytes<32>>;
+witness cancelFindPath(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
+
+circuit orderCommitment(data: Vector<5, Bytes<32>>): Bytes<32> {
+    return upgradeFromTransient(transientHash<Vector<6, Field>>([
+        degradeToTransient(pad(32, "ascend-v2-commit")),
+        degradeToTransient(data[0]),
+        degradeToTransient(data[1]),
+        degradeToTransient(data[2]),
+        degradeToTransient(data[3]),
+        degradeToTransient(data[4])
+    ]));
+}
+
+circuit orderNullifier(data: Vector<5, Bytes<32>>): Bytes<32> {
+    return persistentHash<Vector<6, Bytes<32>>>([
+        pad(32, "ascend-v2-nullfr"),
+        data[0], data[1], data[2], data[3], data[4]
+    ]);
+}
+
+export circuit getBaseColor(): Bytes<32> {
+    return baseColor;
+}
+
+export circuit getQuoteColor(): Bytes<32> {
+    return quoteColor;
+}
+
+export circuit getCounter(): Uint<64> {
+    return counter;
+}
+
+
+export circuit placeOrder(
+    commitment: Bytes<32>,
+    depositAmount: Uint<64>,
+    depositColor: Bytes<32>
+): [] {
+    const da = disclose(depositAmount);
+    const dc = disclose(depositColor);
+    const c = disclose(commitment);
+
+    assert(da > 0, "zero deposit");
+    assert(dc == baseColor || dc == quoteColor, "invalid token color");
+    assert(!deposits.member(c), "duplicate commitment");
+    assert(counter < 16384 as Uint<64>, "tree full");
+
+    counter = counter + 1 as Uint<64>;
+    commitments.insertHash(c);
+    receiveUnshielded(dc, da);
+
+    deposits.insert(c, DepositSlot{ da, dc });
+}
+
+export circuit settle(
+    fillAmount: Uint<64>,
+    fillPrice: Uint<64>,
+    fee: Uint<64>,
+    buyNullifier: Bytes<32>,
+    sellNullifier: Bytes<32>,
+    buyRecipient: Either<ContractAddress, UserAddress>,
+    sellRecipient: Either<ContractAddress, UserAddress>,
+    buyRemainderCommitment: Bytes<32>,
+    sellRemainderCommitment: Bytes<32>
+): [] {
+    const bd = orderData1();
+    const sd = orderData2();
+    const bc = orderCommitment(bd);
+    const sc = orderCommitment(sd);
+
+    assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath1(bc)))), "buy not in tree");
+    assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath2(sc)))), "sell not in tree");
+
+    assert(orderNullifier(bd) == disclose(buyNullifier), "buy nul mismatch");
+    assert(orderNullifier(sd) == disclose(sellNullifier), "sell nul mismatch");
+    assert(!nullifiers.member(disclose(buyNullifier)), "buy already spent");
+    assert(!nullifiers.member(disclose(sellNullifier)), "sell already spent");
+    nullifiers.insert(disclose(buyNullifier));
+    nullifiers.insert(disclose(sellNullifier));
+
+    assert(deposits.member(disclose(bc)), "buy deposit missing");
+    assert(deposits.member(disclose(sc)), "sell deposit missing");
+    const buyDep = deposits.lookup(disclose(bc));
+    const sellDep = deposits.lookup(disclose(sc));
+    assert(buyDep.depositColor == quoteColor, "buy must deposit quote");
+    assert(sellDep.depositColor == baseColor, "sell must deposit base");
+
+    const fa = disclose(fillAmount);
+    const fp = disclose(fillPrice);
+    const quoteTotal = fa * fp;
+    const f = disclose(fee);
+    assert(f * 10000 >= quoteTotal * feeBps, "fee too low");
+    assert(f <= quoteTotal, "fee exceeds total");
+
+    assert(fa <= sellDep.depositAmount, "fill exceeds sell deposit");
+    assert(quoteTotal <= buyDep.depositAmount, "fill exceeds buy deposit");
+
+    const buyLimitPrice = bd[4] as Uint<64>;
+    const sellLimitPrice = sd[4] as Uint<64>;
+    assert(fp <= buyLimitPrice, "fill above buy limit");
+    assert(fp >= sellLimitPrice, "fill below sell limit");
+
+    feeAccumulated = feeAccumulated + f as Uint<128>;
+
+    const buyExcess = buyDep.depositAmount - quoteTotal;
+    const sellExcess = sellDep.depositAmount - fa;
+
+    deposits.remove(disclose(bc));
+    deposits.remove(disclose(sc));
+
+    const buyRecipDisc = disclose(buyRecipient);
+    const sellRecipDisc = disclose(sellRecipient);
+    assert(!buyRecipDisc.is_left, "buy recipient must be UserAddress");
+    assert(!sellRecipDisc.is_left, "sell recipient must be UserAddress");
+    assert(buyRecipDisc.right.bytes == bd[2], "buy recipient must match owner");
+    assert(sellRecipDisc.right.bytes == sd[2], "sell recipient must match owner");
+
+    sendUnshielded(baseColor, fa, buyRecipDisc);
+    sendUnshielded(quoteColor, quoteTotal - f, sellRecipDisc);
+
+    if (buyExcess > 0 as Uint<64>) {
+        const brc = disclose(buyRemainderCommitment);
+        assert(!deposits.member(brc), "buy remainder duplicate");
+        assert(counter < 16384 as Uint<64>, "tree full for remainder");
+        counter = counter + 1 as Uint<64>;
+        commitments.insertHash(brc);
+        deposits.insert(brc, DepositSlot{ buyExcess, quoteColor });
+    }
+    if (sellExcess > 0 as Uint<64>) {
+        const src = disclose(sellRemainderCommitment);
+        assert(!deposits.member(src), "sell remainder duplicate");
+        assert(counter < 16384 as Uint<64>, "tree full for remainder");
+        counter = counter + 1 as Uint<64>;
+        commitments.insertHash(src);
+        deposits.insert(src, DepositSlot{ sellExcess, baseColor });
+    }
+}
+
+export circuit settleBatch(
+    fillCount: Uint<8>,
+    fillAmount1: Uint<64>, fillPrice1: Uint<64>, fee1: Uint<64>,
+    buyNul1: Bytes<32>, sellNul1: Bytes<32>,
+    buyRecip1: Either<ContractAddress, UserAddress>,
+    sellRecip1: Either<ContractAddress, UserAddress>,
+    fillAmount2: Uint<64>, fillPrice2: Uint<64>, fee2: Uint<64>,
+    buyNul2: Bytes<32>, sellNul2: Bytes<32>,
+    buyRecip2: Either<ContractAddress, UserAddress>,
+    sellRecip2: Either<ContractAddress, UserAddress>,
+    fillAmount3: Uint<64>, fillPrice3: Uint<64>, fee3: Uint<64>,
+    buyNul3: Bytes<32>, sellNul3: Bytes<32>,
+    buyRecip3: Either<ContractAddress, UserAddress>,
+    sellRecip3: Either<ContractAddress, UserAddress>,
+    fillAmount4: Uint<64>, fillPrice4: Uint<64>, fee4: Uint<64>,
+    buyNul4: Bytes<32>, sellNul4: Bytes<32>,
+    buyRecip4: Either<ContractAddress, UserAddress>,
+    sellRecip4: Either<ContractAddress, UserAddress>
+): [] {
+    assert(disclose(fillCount) > 0, "fillCount must be > 0");
+    assert(disclose(fillCount) < 5, "fillCount must be < 5");
+
+    const bd1 = orderData1();
+    const sd1 = orderData2();
+    const bc1 = orderCommitment(bd1);
+    const sc1 = orderCommitment(sd1);
+    assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath1(bc1)))), "buy1 not in tree");
+    assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath2(sc1)))), "sell1 not in tree");
+    assert(orderNullifier(bd1) == disclose(buyNul1), "buy1 nul mismatch");
+    assert(orderNullifier(sd1) == disclose(sellNul1), "sell1 nul mismatch");
+    assert(!nullifiers.member(disclose(buyNul1)), "buy1 already spent");
+    assert(!nullifiers.member(disclose(sellNul1)), "sell1 already spent");
+    nullifiers.insert(disclose(buyNul1));
+    nullifiers.insert(disclose(sellNul1));
+    assert(deposits.member(disclose(bc1)), "buy1 deposit missing");
+    assert(deposits.member(disclose(sc1)), "sell1 deposit missing");
+    const bd1dep = deposits.lookup(disclose(bc1));
+    const sd1dep = deposits.lookup(disclose(sc1));
+    assert(bd1dep.depositColor == quoteColor, "buy1 must deposit quote");
+    assert(sd1dep.depositColor == baseColor, "sell1 must deposit base");
+    const fa1 = disclose(fillAmount1);
+    const fp1 = disclose(fillPrice1);
+    const qt1 = fa1 * fp1;
+    const f1 = disclose(fee1);
+    assert(f1 * 10000 >= qt1 * feeBps, "fee1 too low");
+    assert(f1 <= qt1, "fee1 exceeds total");
+    assert(fa1 <= sd1dep.depositAmount, "fill1 exceeds sell deposit");
+    assert(qt1 <= bd1dep.depositAmount, "fill1 exceeds buy deposit");
+    const buyLimit1 = bd1[4] as Uint<64>;
+    const sellLimit1 = sd1[4] as Uint<64>;
+    assert(fp1 <= buyLimit1, "fill1 above buy limit");
+    assert(fp1 >= sellLimit1, "fill1 below sell limit");
+    feeAccumulated = feeAccumulated + f1 as Uint<128>;
+    const buyExcess1 = bd1dep.depositAmount - qt1;
+    const sellExcess1 = sd1dep.depositAmount - fa1;
+    deposits.remove(disclose(bc1));
+    deposits.remove(disclose(sc1));
+    const buyRecipD1 = disclose(buyRecip1);
+    const sellRecipD1 = disclose(sellRecip1);
+    assert(!buyRecipD1.is_left, "buy1 recipient must be UserAddress");
+    assert(!sellRecipD1.is_left, "sell1 recipient must be UserAddress");
+    assert(buyRecipD1.right.bytes == bd1[2], "buy1 recipient must match owner");
+    assert(sellRecipD1.right.bytes == sd1[2], "sell1 recipient must match owner");
+    sendUnshielded(baseColor, fa1, buyRecipD1);
+    sendUnshielded(quoteColor, qt1 - f1, sellRecipD1);
+    if (buyExcess1 > 0 as Uint<64>) {
+        sendUnshielded(quoteColor, buyExcess1, buyRecipD1);
+    }
+    if (sellExcess1 > 0 as Uint<64>) {
+        sendUnshielded(baseColor, sellExcess1, sellRecipD1);
+    }
+
+    if (disclose(fillCount) > 1) {
+        const bd2 = orderData3();
+        const sd2 = orderData4();
+        const bc2 = orderCommitment(bd2);
+        const sc2 = orderCommitment(sd2);
+        assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath3(bc2)))), "buy2 not in tree");
+        assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath4(sc2)))), "sell2 not in tree");
+        assert(orderNullifier(bd2) == disclose(buyNul2), "buy2 nul mismatch");
+        assert(orderNullifier(sd2) == disclose(sellNul2), "sell2 nul mismatch");
+        assert(!nullifiers.member(disclose(buyNul2)), "buy2 already spent");
+        assert(!nullifiers.member(disclose(sellNul2)), "sell2 already spent");
+        nullifiers.insert(disclose(buyNul2));
+        nullifiers.insert(disclose(sellNul2));
+        assert(deposits.member(disclose(bc2)), "buy2 deposit missing");
+        assert(deposits.member(disclose(sc2)), "sell2 deposit missing");
+        const bd2dep = deposits.lookup(disclose(bc2));
+        const sd2dep = deposits.lookup(disclose(sc2));
+        assert(bd2dep.depositColor == quoteColor, "buy2 must deposit quote");
+        assert(sd2dep.depositColor == baseColor, "sell2 must deposit base");
+        const fa2 = disclose(fillAmount2);
+        const fp2 = disclose(fillPrice2);
+        const qt2 = fa2 * fp2;
+        const f2 = disclose(fee2);
+        assert(f2 * 10000 >= qt2 * feeBps, "fee2 too low");
+        assert(f2 <= qt2, "fee2 exceeds total");
+        assert(fa2 <= sd2dep.depositAmount, "fill2 exceeds sell deposit");
+        assert(qt2 <= bd2dep.depositAmount, "fill2 exceeds buy deposit");
+        const buyLimit2 = bd2[4] as Uint<64>;
+        const sellLimit2 = sd2[4] as Uint<64>;
+        assert(fp2 <= buyLimit2, "fill2 above buy limit");
+        assert(fp2 >= sellLimit2, "fill2 below sell limit");
+        feeAccumulated = feeAccumulated + f2 as Uint<128>;
+        const buyExcess2 = bd2dep.depositAmount - qt2;
+        const sellExcess2 = sd2dep.depositAmount - fa2;
+        deposits.remove(disclose(bc2));
+        deposits.remove(disclose(sc2));
+        const buyRecipD2 = disclose(buyRecip2);
+        const sellRecipD2 = disclose(sellRecip2);
+        assert(!buyRecipD2.is_left, "buy2 recipient must be UserAddress");
+        assert(!sellRecipD2.is_left, "sell2 recipient must be UserAddress");
+        assert(buyRecipD2.right.bytes == bd2[2], "buy2 recipient must match owner");
+        assert(sellRecipD2.right.bytes == sd2[2], "sell2 recipient must match owner");
+        sendUnshielded(baseColor, fa2, buyRecipD2);
+        sendUnshielded(quoteColor, qt2 - f2, sellRecipD2);
+        if (buyExcess2 > 0 as Uint<64>) {
+            sendUnshielded(quoteColor, buyExcess2, buyRecipD2);
+        }
+        if (sellExcess2 > 0 as Uint<64>) {
+            sendUnshielded(baseColor, sellExcess2, sellRecipD2);
+        }
+    }
+
+    if (disclose(fillCount) > 2) {
+        const bd3 = orderData5();
+        const sd3 = orderData6();
+        const bc3 = orderCommitment(bd3);
+        const sc3 = orderCommitment(sd3);
+        assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath5(bc3)))), "buy3 not in tree");
+        assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath6(sc3)))), "sell3 not in tree");
+        assert(orderNullifier(bd3) == disclose(buyNul3), "buy3 nul mismatch");
+        assert(orderNullifier(sd3) == disclose(sellNul3), "sell3 nul mismatch");
+        assert(!nullifiers.member(disclose(buyNul3)), "buy3 already spent");
+        assert(!nullifiers.member(disclose(sellNul3)), "sell3 already spent");
+        nullifiers.insert(disclose(buyNul3));
+        nullifiers.insert(disclose(sellNul3));
+        assert(deposits.member(disclose(bc3)), "buy3 deposit missing");
+        assert(deposits.member(disclose(sc3)), "sell3 deposit missing");
+        const bd3dep = deposits.lookup(disclose(bc3));
+        const sd3dep = deposits.lookup(disclose(sc3));
+        assert(bd3dep.depositColor == quoteColor, "buy3 must deposit quote");
+        assert(sd3dep.depositColor == baseColor, "sell3 must deposit base");
+        const fa3 = disclose(fillAmount3);
+        const fp3 = disclose(fillPrice3);
+        const qt3 = fa3 * fp3;
+        const f3 = disclose(fee3);
+        assert(f3 * 10000 >= qt3 * feeBps, "fee3 too low");
+        assert(f3 <= qt3, "fee3 exceeds total");
+        assert(fa3 <= sd3dep.depositAmount, "fill3 exceeds sell deposit");
+        assert(qt3 <= bd3dep.depositAmount, "fill3 exceeds buy deposit");
+        const buyLimit3 = bd3[4] as Uint<64>;
+        const sellLimit3 = sd3[4] as Uint<64>;
+        assert(fp3 <= buyLimit3, "fill3 above buy limit");
+        assert(fp3 >= sellLimit3, "fill3 below sell limit");
+        feeAccumulated = feeAccumulated + f3 as Uint<128>;
+        const buyExcess3 = bd3dep.depositAmount - qt3;
+        const sellExcess3 = sd3dep.depositAmount - fa3;
+        deposits.remove(disclose(bc3));
+        deposits.remove(disclose(sc3));
+        const buyRecipD3 = disclose(buyRecip3);
+        const sellRecipD3 = disclose(sellRecip3);
+        assert(!buyRecipD3.is_left, "buy3 recipient must be UserAddress");
+        assert(!sellRecipD3.is_left, "sell3 recipient must be UserAddress");
+        assert(buyRecipD3.right.bytes == bd3[2], "buy3 recipient must match owner");
+        assert(sellRecipD3.right.bytes == sd3[2], "sell3 recipient must match owner");
+        sendUnshielded(baseColor, fa3, buyRecipD3);
+        sendUnshielded(quoteColor, qt3 - f3, sellRecipD3);
+        if (buyExcess3 > 0 as Uint<64>) {
+            sendUnshielded(quoteColor, buyExcess3, buyRecipD3);
+        }
+        if (sellExcess3 > 0 as Uint<64>) {
+            sendUnshielded(baseColor, sellExcess3, sellRecipD3);
+        }
+    }
+
+    if (disclose(fillCount) > 3) {
+        const bd4 = orderData7();
+        const sd4 = orderData8();
+        const bc4 = orderCommitment(bd4);
+        const sc4 = orderCommitment(sd4);
+        assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath7(bc4)))), "buy4 not in tree");
+        assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(findPath8(sc4)))), "sell4 not in tree");
+        assert(orderNullifier(bd4) == disclose(buyNul4), "buy4 nul mismatch");
+        assert(orderNullifier(sd4) == disclose(sellNul4), "sell4 nul mismatch");
+        assert(!nullifiers.member(disclose(buyNul4)), "buy4 already spent");
+        assert(!nullifiers.member(disclose(sellNul4)), "sell4 already spent");
+        nullifiers.insert(disclose(buyNul4));
+        nullifiers.insert(disclose(sellNul4));
+        assert(deposits.member(disclose(bc4)), "buy4 deposit missing");
+        assert(deposits.member(disclose(sc4)), "sell4 deposit missing");
+        const bd4dep = deposits.lookup(disclose(bc4));
+        const sd4dep = deposits.lookup(disclose(sc4));
+        assert(bd4dep.depositColor == quoteColor, "buy4 must deposit quote");
+        assert(sd4dep.depositColor == baseColor, "sell4 must deposit base");
+        const fa4 = disclose(fillAmount4);
+        const fp4 = disclose(fillPrice4);
+        const qt4 = fa4 * fp4;
+        const f4 = disclose(fee4);
+        assert(f4 * 10000 >= qt4 * feeBps, "fee4 too low");
+        assert(f4 <= qt4, "fee4 exceeds total");
+        assert(fa4 <= sd4dep.depositAmount, "fill4 exceeds sell deposit");
+        assert(qt4 <= bd4dep.depositAmount, "fill4 exceeds buy deposit");
+        const buyLimit4 = bd4[4] as Uint<64>;
+        const sellLimit4 = sd4[4] as Uint<64>;
+        assert(fp4 <= buyLimit4, "fill4 above buy limit");
+        assert(fp4 >= sellLimit4, "fill4 below sell limit");
+        feeAccumulated = feeAccumulated + f4 as Uint<128>;
+        const buyExcess4 = bd4dep.depositAmount - qt4;
+        const sellExcess4 = sd4dep.depositAmount - fa4;
+        deposits.remove(disclose(bc4));
+        deposits.remove(disclose(sc4));
+        const buyRecipD4 = disclose(buyRecip4);
+        const sellRecipD4 = disclose(sellRecip4);
+        assert(!buyRecipD4.is_left, "buy4 recipient must be UserAddress");
+        assert(!sellRecipD4.is_left, "sell4 recipient must be UserAddress");
+        assert(buyRecipD4.right.bytes == bd4[2], "buy4 recipient must match owner");
+        assert(sellRecipD4.right.bytes == sd4[2], "sell4 recipient must match owner");
+        sendUnshielded(baseColor, fa4, buyRecipD4);
+        sendUnshielded(quoteColor, qt4 - f4, sellRecipD4);
+        if (buyExcess4 > 0 as Uint<64>) {
+            sendUnshielded(quoteColor, buyExcess4, buyRecipD4);
+        }
+        if (sellExcess4 > 0 as Uint<64>) {
+            sendUnshielded(baseColor, sellExcess4, sellRecipD4);
+        }
+    }
+}
+
+export circuit cancelOrder(
+    nullifier: Bytes<32>,
+    recipient: Either<ContractAddress, UserAddress>
+): [] {
+    const data = cancelOrderData();
+    const commit = orderCommitment(data);
+    const path = cancelFindPath(commit);
+    assert(commitments.checkRoot(disclose(merkleTreePathRootNoLeafHash<14>(path))), "order not in tree");
+
+    assert(orderNullifier(data) == disclose(nullifier), "nullifier mismatch");
+    assert(!nullifiers.member(disclose(nullifier)), "already spent");
+    nullifiers.insert(disclose(nullifier));
+
+    assert(deposits.member(disclose(commit)), "deposit missing");
+    const dep = deposits.lookup(disclose(commit));
+    deposits.remove(disclose(commit));
+
+    const recipDisc = disclose(recipient);
+    assert(!recipDisc.is_left, "recipient must be UserAddress");
+    assert(recipDisc.right.bytes == data[2], "recipient must match owner");
+
+    sendUnshielded(dep.depositColor, dep.depositAmount, recipDisc);
+}
+
+export circuit rewardTreasury(): [] {
+    assert(feeAccumulated > 0, "no fees to withdraw");
+    sendUnshielded(quoteColor, feeAccumulated, treasury);
+    feeAccumulated = 0;
+}
+
+
+export circuit resetHistory(): [] {
+    commitments.resetHistory();
+}
