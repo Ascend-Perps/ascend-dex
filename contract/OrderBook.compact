@@ -19,7 +19,7 @@ export ledger treasury: Either<ContractAddress, UserAddress>;
 export ledger feeAccumulated: Uint<128>;
 export ledger counter: Uint<64>;
 
-export ledger admin: ZswapCoinPublicKey;       
+export ledger admin: Bytes<32>;                  
 export ledger minDeposit: Uint<64>;              
 export ledger minFillAmount: Uint<64>;          
 
@@ -28,7 +28,6 @@ constructor(
     t: Either<ContractAddress, UserAddress>,
     bc: Bytes<32>,
     qc: Bytes<32>,
-    adm: ZswapCoinPublicKey,
     minDep: Uint<64>,
     minFill: Uint<64>
 ) {
@@ -37,11 +36,13 @@ constructor(
     treasury = disclose(t);
     baseColor = disclose(bc);
     quoteColor = disclose(qc);
-    admin = disclose(adm);
     minDeposit = disclose(minDep);
     minFillAmount = disclose(minFill);
     feeAccumulated = 0;
     counter = 0;
+
+    const _sk = localSk();
+    admin = disclose(dappPubKey(_sk));
 }
 
 witness orderData1(): Vector<5, Bytes<32>>;
@@ -65,6 +66,8 @@ witness findPath8(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
 witness cancelOrderData(): Vector<5, Bytes<32>>;
 witness cancelFindPath(commit: Bytes<32>): MerkleTreePath<14, Bytes<32>>;
 
+witness localSk(): Bytes<32>;
+
 circuit orderCommitment(data: Vector<5, Bytes<32>>): Bytes<32> {
     return upgradeFromTransient(transientHash<Vector<6, Field>>([
         degradeToTransient(pad(32, "ascend-v2-commit")),
@@ -81,6 +84,12 @@ circuit orderNullifier(data: Vector<5, Bytes<32>>): Bytes<32> {
         pad(32, "ascend-v2-nullfr"),
         data[0], data[1], data[2], data[3], data[4]
     ]);
+}
+
+circuit dappPubKey(_sk: Bytes<32>): Bytes<32> {
+    return persistentHash<Vector<2, Bytes<32>>>(
+        [pad(32, "ascend-v2-admin:"), _sk]
+    );
 }
 
 export circuit getBaseColor(): Bytes<32> {
@@ -472,6 +481,7 @@ export circuit rewardTreasury(): [] {
 }
 
 export circuit resetHistory(): [] {
-    assert(admin == ownPublicKey(), "only admin");
+    const _sk = localSk();
+    assert(admin == disclose(dappPubKey(_sk)), "only admin");
     commitments.resetHistory();
 }
