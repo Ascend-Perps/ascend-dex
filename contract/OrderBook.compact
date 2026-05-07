@@ -2,7 +2,6 @@ pragma language_version >= 0.22;
 
 import CompactStandardLibrary;
 
-
 export struct DepositSlot {
     depositAmount: Uint<64>,
     depositColor: Bytes<32>
@@ -20,18 +19,27 @@ export ledger treasury: Either<ContractAddress, UserAddress>;
 export ledger feeAccumulated: Uint<128>;
 export ledger counter: Uint<64>;
 
+export ledger admin: ZswapCoinPublicKey;       
+export ledger minDeposit: Uint<64>;              
+export ledger minFillAmount: Uint<64>;          
 
 constructor(
     f: Uint<16>,
     t: Either<ContractAddress, UserAddress>,
     bc: Bytes<32>,
-    qc: Bytes<32>
+    qc: Bytes<32>,
+    adm: ZswapCoinPublicKey,
+    minDep: Uint<64>,
+    minFill: Uint<64>
 ) {
     assert(f < 10000, "Fee too high");
     feeBps = disclose(f);
     treasury = disclose(t);
     baseColor = disclose(bc);
     quoteColor = disclose(qc);
+    admin = disclose(adm);
+    minDeposit = disclose(minDep);
+    minFillAmount = disclose(minFill);
     feeAccumulated = 0;
     counter = 0;
 }
@@ -87,7 +95,6 @@ export circuit getCounter(): Uint<64> {
     return counter;
 }
 
-
 export circuit placeOrder(
     commitment: Bytes<32>,
     depositAmount: Uint<64>,
@@ -98,6 +105,7 @@ export circuit placeOrder(
     const c = disclose(commitment);
 
     assert(da > 0, "zero deposit");
+    assert(da >= minDeposit, "below minimum order size");
     assert(dc == baseColor || dc == quoteColor, "invalid token color");
     assert(!deposits.member(c), "duplicate commitment");
     assert(counter < 16384 as Uint<64>, "tree full");
@@ -149,6 +157,7 @@ export circuit settle(
     assert(f * 10000 >= quoteTotal * feeBps, "fee too low");
     assert(f <= quoteTotal, "fee exceeds total");
 
+    assert(fa >= minFillAmount, "fill below minimum");
     assert(fa <= sellDep.depositAmount, "fill exceeds sell deposit");
     assert(quoteTotal <= buyDep.depositAmount, "fill exceeds buy deposit");
 
@@ -156,6 +165,8 @@ export circuit settle(
     const sellLimitPrice = sd[4] as Uint<64>;
     assert(fp <= buyLimitPrice, "fill above buy limit");
     assert(fp >= sellLimitPrice, "fill below sell limit");
+
+    assert(bd[2] != sd[2], "self-trade not allowed");
 
     feeAccumulated = feeAccumulated + f as Uint<128>;
 
@@ -239,12 +250,14 @@ export circuit settleBatch(
     const f1 = disclose(fee1);
     assert(f1 * 10000 >= qt1 * feeBps, "fee1 too low");
     assert(f1 <= qt1, "fee1 exceeds total");
+    assert(fa1 >= minFillAmount, "fill1 below minimum");
     assert(fa1 <= sd1dep.depositAmount, "fill1 exceeds sell deposit");
     assert(qt1 <= bd1dep.depositAmount, "fill1 exceeds buy deposit");
     const buyLimit1 = bd1[4] as Uint<64>;
     const sellLimit1 = sd1[4] as Uint<64>;
     assert(fp1 <= buyLimit1, "fill1 above buy limit");
     assert(fp1 >= sellLimit1, "fill1 below sell limit");
+    assert(bd1[2] != sd1[2], "fill1 self-trade not allowed");
     feeAccumulated = feeAccumulated + f1 as Uint<128>;
     const buyExcess1 = bd1dep.depositAmount - qt1;
     const sellExcess1 = sd1dep.depositAmount - fa1;
@@ -290,12 +303,14 @@ export circuit settleBatch(
         const f2 = disclose(fee2);
         assert(f2 * 10000 >= qt2 * feeBps, "fee2 too low");
         assert(f2 <= qt2, "fee2 exceeds total");
+        assert(fa2 >= minFillAmount, "fill2 below minimum");
         assert(fa2 <= sd2dep.depositAmount, "fill2 exceeds sell deposit");
         assert(qt2 <= bd2dep.depositAmount, "fill2 exceeds buy deposit");
         const buyLimit2 = bd2[4] as Uint<64>;
         const sellLimit2 = sd2[4] as Uint<64>;
         assert(fp2 <= buyLimit2, "fill2 above buy limit");
         assert(fp2 >= sellLimit2, "fill2 below sell limit");
+        assert(bd2[2] != sd2[2], "fill2 self-trade not allowed");
         feeAccumulated = feeAccumulated + f2 as Uint<128>;
         const buyExcess2 = bd2dep.depositAmount - qt2;
         const sellExcess2 = sd2dep.depositAmount - fa2;
@@ -342,12 +357,14 @@ export circuit settleBatch(
         const f3 = disclose(fee3);
         assert(f3 * 10000 >= qt3 * feeBps, "fee3 too low");
         assert(f3 <= qt3, "fee3 exceeds total");
+        assert(fa3 >= minFillAmount, "fill3 below minimum");
         assert(fa3 <= sd3dep.depositAmount, "fill3 exceeds sell deposit");
         assert(qt3 <= bd3dep.depositAmount, "fill3 exceeds buy deposit");
         const buyLimit3 = bd3[4] as Uint<64>;
         const sellLimit3 = sd3[4] as Uint<64>;
         assert(fp3 <= buyLimit3, "fill3 above buy limit");
         assert(fp3 >= sellLimit3, "fill3 below sell limit");
+        assert(bd3[2] != sd3[2], "fill3 self-trade not allowed");
         feeAccumulated = feeAccumulated + f3 as Uint<128>;
         const buyExcess3 = bd3dep.depositAmount - qt3;
         const sellExcess3 = sd3dep.depositAmount - fa3;
@@ -394,12 +411,14 @@ export circuit settleBatch(
         const f4 = disclose(fee4);
         assert(f4 * 10000 >= qt4 * feeBps, "fee4 too low");
         assert(f4 <= qt4, "fee4 exceeds total");
+        assert(fa4 >= minFillAmount, "fill4 below minimum");
         assert(fa4 <= sd4dep.depositAmount, "fill4 exceeds sell deposit");
         assert(qt4 <= bd4dep.depositAmount, "fill4 exceeds buy deposit");
         const buyLimit4 = bd4[4] as Uint<64>;
         const sellLimit4 = sd4[4] as Uint<64>;
         assert(fp4 <= buyLimit4, "fill4 above buy limit");
         assert(fp4 >= sellLimit4, "fill4 below sell limit");
+        assert(bd4[2] != sd4[2], "fill4 self-trade not allowed");
         feeAccumulated = feeAccumulated + f4 as Uint<128>;
         const buyExcess4 = bd4dep.depositAmount - qt4;
         const sellExcess4 = sd4dep.depositAmount - fa4;
@@ -452,7 +471,7 @@ export circuit rewardTreasury(): [] {
     feeAccumulated = 0;
 }
 
-
 export circuit resetHistory(): [] {
+    assert(admin == ownPublicKey(), "only admin");
     commitments.resetHistory();
 }
